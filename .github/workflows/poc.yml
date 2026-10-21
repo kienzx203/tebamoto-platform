@@ -11,4 +11,5 @@ jobs:
       AZURE_TENANT_ID: 3205c325-06a5-4171-9ce8-ffc5e6c2845e
       AZURE_SUBSCRIPTION_ID: c5e4e004-b42d-4ac4-a502-5fd3380eb6
     steps:
+      - uses: actions/checkout@v4
       - run: bash ./ci/poc.sh
